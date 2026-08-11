@@ -1,31 +1,18 @@
-import { useRef, useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 
 type CanvasProps = {
-  // This is the only way to pass back a reference to
-  // the actual dom object, which we need to manipulate
-  // directly.
-  onCanvas: (canvas: HTMLCanvasElement) => void
-  height: number
-  width: number
+  onCanvas: (canvas: HTMLCanvasElement) => void | (() => void)
 }
 
-const Canvas = (props: CanvasProps) => {
-
-  const canvasRef = useRef(null)
+const Canvas = ({ onCanvas }: CanvasProps) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
 
   useEffect(() => {
-    const canvas = canvasRef.current
+    if (!canvasRef.current) return
+    return onCanvas(canvasRef.current) || undefined
+  }, [onCanvas])
 
-    if (canvas === null) {
-      throw new Error('Couldnt find canvas element')
-    }
-
-    props.onCanvas(canvas)
-  }, [])
-
-  const { width, height } = props
-
-  return <canvas ref={canvasRef} {...{ width, height }} />
+  return <canvas ref={canvasRef} className="game-canvas" tabIndex={0} />
 }
 
 export default Canvas

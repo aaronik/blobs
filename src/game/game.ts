@@ -1,281 +1,611 @@
 import * as BABYLON from 'babylonjs'
-// import * as particleSystem from '../visuals/particle-system'
-import * as ammoOrbs from '../visuals/ammo-orb'
+import 'babylonjs-loaders'
 
-const NUM_SPHERES = 5
-const SPHERE_MAX_SIZE = 1
-const SPHERE_MIN_SIZE = 0.5
-const SPHERE_MAX_HEALTH = 1000
-const SPHERE_POSITION_SPREAD = (Math.log(SPHERE_MAX_SIZE) + 1) * 100
-const INITIAL_CAMERA_DISTANCE = SPHERE_POSITION_SPREAD * 1.5
-const PROJECTILE_RATE_MULTIPLIER = (SPHERE_MAX_HEALTH) * 0.5 // The higher the slower
-
-export type Side = keyof typeof COLORS3
-export type Color = typeof COLORS3[keyof typeof COLORS3]
-type Sphere = BABYLON.Mesh
-
-const COLORS3 = {
-  darkGreen: new BABYLON.Color3(0, 42 / 255, 16 / 255), // dark green
-  green: BABYLON.Color3.Green(),
-  yellow: BABYLON.Color3.Yellow(),
-  pink: BABYLON.Color3.Red(),
+export type GameStatus = 'playing' | 'won' | 'lost'
+export type GameSnapshot = {
+  playerNodes: number
+  enemyNodes: number
+  neutralNodes: number
+  status: GameStatus
+  selected: boolean
 }
 
-const getAveragePosition = (objects: { position: BABYLON.Vector3 }[]) => {
-  const sumVec = objects.reduce((sum, object) => {
+export type Side = 'player' | 'enemy' | 'neutral'
+type Team = Side
+type Node = {
+  id: string
+  team: Team
+  energy: number
+  maxEnergy: number
+  position: BABYLON.Vector3
+  root: BABYLON.Mesh
+  shell: BABYLON.Mesh
+  visual?: BABYLON.AbstractMesh
+  motes: BABYLON.Mesh[]
+  selectionHalo: BABYLON.Mesh
+  selectionHaloOuter: BABYLON.Mesh
+  selectionFade: number
+  outputCursor: number
+  orbitPhase: number
+  label: BABYLON.Mesh
+  texture: BABYLON.DynamicTexture
+}
+
+type ConnectionUnit = {
+  mesh: BABYLON.Mesh
+  trail: BABYLON.TrailMesh
+  path: BABYLON.Vector3[]
+  pathLength: number
+  progress: number
+  team: Exclude<Team, 'neutral'>
+}
+
+type Link = {
+  key: string
+  from: Node
+  to: Node
+  units: ConnectionUnit[]
+  firing: boolean
+  cooldown: number
+  path: BABYLON.Vector3[]
+}
+
+const COLORS: Record<Team, BABYLON.Color3> = {
+  player: BABYLON.Color3.FromHexString('#52f6d2'),
+  enemy: BABYLON.Color3.FromHexString('#ff4f91'),
+  neutral: BABYLON.Color3.FromHexString('#8b91a8'),
+}
+
+const ASSET_FOR_TEAM: Record<Team, string> = {
+  player: 'greenEnergyBall.glb',
+  enemy: 'pinkEnergyBall.glb',
+  neutral: 'yellowEnergyBall.glb',
+}
+
+type LevelNode = {
+  x: number
+  y: number
+  z: number
+  team: Team
+  energy: number
+  max: number
+}
+
+const randomInt = (min: number, max: number) => Math.floor(Math.random() * (max - min + 1)) + min
+const isNear = (position: BABYLON.Vector3, candidate: BABYLON.Vector3) => {
+  const dx = position.x - candidate.x
+  const dy = position.y - candidate.y
+  const dz = position.z - candidate.z
+  return Math.sqrt(dx * dx + dy * dy + dz * dz) < 4
+}
+
+const isTooCloseToAny = (positions: BABYLON.Vector3[], candidate: BABYLON.Vector3) => {
+  for (const position of positions) if (isNear(position, candidate)) return true
+  return false
+}
+
+const generateLevel = (): LevelNode[] => {
+  const count = randomInt(7, 12)
+  const positions: BABYLON.Vector3[] = []
+
+  for (let i = 0; i < count; i += 1) {
+    let candidate = BABYLON.Vector3.Zero()
+    let attempts = 0
+    do {
+      candidate = new BABYLON.Vector3(
+        (Math.random() - 0.5) * 22,
+        (Math.random() - 0.5) * 9,
+        (Math.random() - 0.5) * 14,
+      )
+      attempts += 1
+    } while (attempts < 100 && isTooCloseToAny(positions, candidate))
+    positions.push(candidate)
+  }
+
+  const teamMax = randomInt(80, 200)
+  const teamStartingEnergy = Math.round(teamMax * (0.42 + Math.random() * 0.14))
+
+  return positions.map((position, index) => {
+    const team: Team = index === 0 ? 'player' : index === count - 1 ? 'enemy' : 'neutral'
+    const max = team === 'neutral' ? randomInt(45, 200) : teamMax
+    const energy = team === 'neutral'
+      ? Math.max(12, Math.round(max * (0.28 + Math.random() * 0.18)))
+      : teamStartingEnergy
     return {
-      x: object.position.x + sum.x,
-      y: object.position.y + sum.y,
-      z: object.position.z + sum.z
+      x: position.x,
+      y: position.y,
+      z: position.z,
+      team,
+      max,
+      energy,
     }
-  }, { x: 0, y: 0, z: 0 })
-
-  return new BABYLON.Vector3(
-    sumVec.x / objects.length,
-    sumVec.y / objects.length,
-    sumVec.z / objects.length,
-  )
-}
-
-const getRandomPosition = () => {
-  return new BABYLON.Vector3(
-    Math.random() * SPHERE_POSITION_SPREAD,
-    Math.random() * SPHERE_POSITION_SPREAD,
-    Math.random() * SPHERE_POSITION_SPREAD
-  )
-}
-
-// TODO This does not work and I'm tired of figuring it out. The issue is that intersectsMesh ALWAYS returns true.
-const ensureNoOverlap = (sphere: Sphere, existingSpheres: Sphere[]) => {
-  const hasIntersections = existingSpheres.some(existingSphere => existingSphere.intersectsMesh(sphere, true, true))
-  if (hasIntersections) {
-    console.log('found collision making ' + sphere.name)
-    sphere.position = getRandomPosition()
-    // ensureNoOverlap()
-  }
-}
-
-const assignOrbToSphere = async (sphere: Sphere, side: Side, scene: BABYLON.Scene) => {
-  const energyBall = await BABYLON.SceneLoader.LoadAssetContainerAsync(side + "EnergyBall.glb", undefined, scene)
-  const orb = energyBall.meshes[0]
-  orb.name = 'orb-' + sphere.name
-  orb.setParent(sphere)
-  scene.addMesh(orb, true)
-  orb.setAbsolutePosition(sphere.getAbsolutePosition())
-  return orb
-}
-
-const removeOrbFromSphere = (sphere: Sphere) => {
-  sphere.getChildMeshes().forEach(child => {
-    sphere.removeChild(child)
-    child.dispose()
   })
 }
 
-const explodeOrb = async (sphere: Sphere, scene: BABYLON.Scene) => {
-  const orb = sphere.getChildMeshes()[3]!
-  const frameRate = 10
-  const expandX = new BABYLON.Animation("xSlide", "scaling.x", frameRate, BABYLON.Animation.ANIMATIONTYPE_FLOAT, BABYLON.Animation.ANIMATIONLOOPMODE_CYCLE)
-  const expandY = new BABYLON.Animation("ySlide", "scaling.y", frameRate, BABYLON.Animation.ANIMATIONTYPE_FLOAT, BABYLON.Animation.ANIMATIONLOOPMODE_CYCLE)
-  const expandZ = new BABYLON.Animation("zSlide", "scaling.z", frameRate, BABYLON.Animation.ANIMATIONTYPE_FLOAT, BABYLON.Animation.ANIMATIONLOOPMODE_CYCLE)
-  const fade = new BABYLON.Animation("fade", "visibility", frameRate, BABYLON.Animation.ANIMATIONTYPE_FLOAT, BABYLON.Animation.ANIMATIONLOOPMODE_CYCLE)
-
-  const expandKeyframes = [
-    { frame: 0, value: orb.scaling.x },
-    { frame: 1, value: orb.scaling.x * 1.2 },
-    { frame: 5, value: orb.scaling.x * 2 },
-  ]
-
-  const visiblityKeyframes = [
-    { frame: 0, value: 1 },
-    { frame: 1, value: 0.8 },
-    { frame: 5, value: 0 }
-  ]
-
-  expandX.setKeys(expandKeyframes)
-  expandY.setKeys(expandKeyframes)
-  expandZ.setKeys(expandKeyframes)
-  fade.setKeys(visiblityKeyframes)
-
-  orb.animations.push(expandX, expandY, expandZ, fade)
-
-  return new Promise(resolve => {
-    scene.beginAnimation(orb, 0, 2 * frameRate, false, undefined, () => {
-      resolve(true)
-    })
-  })
+const makeMaterial = (scene: BABYLON.Scene, name: string, color: BABYLON.Color3, alpha = 1) => {
+  const material = new BABYLON.StandardMaterial(name, scene)
+  material.diffuseColor = color.scale(0.32)
+  material.emissiveColor = color
+  material.specularColor = color
+  material.alpha = alpha
+  return material
 }
 
-const createSphere = async (scene: BABYLON.Scene, existingSpheres: Sphere[]) => {
-  const id = window.crypto.randomUUID()
-
-  const opts = {
-    segments: 16,
-    updatable: true
-  }
-
-  const sphere = BABYLON.MeshBuilder.CreateSphere('sphere-' + id, opts, scene)
-
-  let side: Side = 'green'
-  if (Math.random() > 0.6) side = 'pink'
-  if (Math.random() > 0.6) side = 'yellow'
-
-  sphere.metadata = {
-    health: 5,
-    side: side,
-    color: COLORS3[side],
-    async handleShot(side: Side) {
-      console.log(sphere.metadata)
-      // @ts-ignore
-      window.sphere = sphere
-
-      if (side === sphere.metadata.side) {
-        // Same side, add to health
-        sphere.metadata.health = Math.max(sphere.metadata.health + 1, SPHERE_MAX_SIZE)
-      } else {
-        // Other side, remove health
-        sphere.metadata.health = sphere.metadata.health - 1
-        if (sphere.metadata.health <= 0) {
-          // Out of health, change sides
-          ammoOrbs.stopFor(sphere)
-          sphere.metadata.side = side
-          sphere.metadata.color = COLORS3[side]
-          sphere.metadata.health = 10 // Otherwise it gets messed up toggling quickly between multiple colors
-          await explodeOrb(sphere, scene)
-          removeOrbFromSphere(sphere)
-          const orb = await assignOrbToSphere(sphere, side, scene)
-          // The orb here always comes in at size 1, but it needs to be the sphere's minimum size
-          orb.scaling.scaleInPlace(SPHERE_MIN_SIZE)
-        }
-      }
-      this.updateSize()
-    },
-    updateSize() {
-      const sphereSizeSpread = SPHERE_MAX_SIZE - SPHERE_MIN_SIZE
-      const percentageOfMaxHealth = this.health / SPHERE_MAX_HEALTH
-      const healthSpreadRatio = percentageOfMaxHealth * sphereSizeSpread
-      const finalSize = healthSpreadRatio + SPHERE_MIN_SIZE
-
-      sphere.scaling.x = finalSize
-      sphere.scaling.y = finalSize
-      sphere.scaling.z = finalSize
-    },
-  }
-
-  sphere.isVisible = false
-  // const mat = new BABYLON.StandardMaterial('sourceMat', scene)
-  // mat.emissiveColor = COLORS3[color]
-  // mat.specularColor = BABYLON.Color3.Black()
-  // sphere.material = mat
-
-  await assignOrbToSphere(sphere, side, scene)
-
-  sphere.position = getRandomPosition()
-  sphere.metadata.updateSize()
-
-  ensureNoOverlap(sphere, existingSpheres)
-
-  return sphere
+const getFireInterval = (node: Node) => {
+  const strength = Math.max(0, Math.min(1, node.energy / node.maxEnergy))
+  const baseInterval = 1.3 - Math.pow(strength, 0.7) * 1.05
+  const lowEnergyPenalty = node.energy <= 6 ? (7 - node.energy) * 0.12 : 0
+  return Math.max(0.22, baseInterval + lowEnergyPenalty)
 }
 
-const createScene = async (engine: BABYLON.Engine, canvas: HTMLCanvasElement) => {
-  // Create a basic BJS Scene object
+const game = (canvas: HTMLCanvasElement, onUpdate?: (state: GameSnapshot) => void) => {
+  const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true })
   const scene = new BABYLON.Scene(engine)
-  // Create a FreeCamera, and set its position to {x: 0, y: 5, z: -10}
-  // const camera = new BABYLON.FreeCamera('camera1', new BABYLON.Vector3(0, 5, -10), scene)
-  const camera = new BABYLON.ArcRotateCamera('camera1', 0, 0, INITIAL_CAMERA_DISTANCE, BABYLON.Vector3.Zero(), scene)
+  scene.clearColor = new BABYLON.Color4(0.018, 0.025, 0.065, 1)
+  scene.fogMode = BABYLON.Scene.FOGMODE_EXP2
+  scene.fogDensity = 0.012
+  scene.fogColor = new BABYLON.Color3(0.018, 0.025, 0.065)
 
-  const light = new BABYLON.HemisphericLight('light1', new BABYLON.Vector3(0, 1, 1), scene)
-  light.intensity = 0.3
+  const camera = new BABYLON.ArcRotateCamera('camera', -Math.PI / 2, 1.05, 28, BABYLON.Vector3.Zero(), scene)
+  camera.lowerRadiusLimit = 18
+  camera.upperRadiusLimit = 42
+  camera.wheelPrecision = 35
+  camera.panningSensibility = 90
+  camera.inertia = 0.82
+  camera.angularSensibilityX = 1400
+  camera.angularSensibilityY = 1400
+  camera.attachControl(canvas, true)
 
-  // TODO https://playground.babylonjs.com/#1F4UET#33 has a ground that I think would be nice to have
-  // // Create physics impostors // This ground looked great in the example
-  // const ground = Mesh.CreateBox("Ground", 1, scene)
-  // ground.scaling = new BABYLON.Vector3(100, 1, 100)
-  // ground.position.y = environment.ground.position.y - (0.5 + 0.001)
-  // ground.material = new BABYLON.StandardMaterial("test", scene)
-  // ground.material.alpha = 0.99
-  // ground.material.alphaMode = BABYLON.Engine.ALPHA_ONEONE
+  scene.imageProcessingConfiguration.contrast = 1.2
+  scene.imageProcessingConfiguration.exposure = 1.05
+  scene.imageProcessingConfiguration.vignetteEnabled = true
+  scene.imageProcessingConfiguration.vignetteWeight = 1.4
+  scene.imageProcessingConfiguration.vignetteColor = new BABYLON.Color4(0.005, 0.008, 0.03, 1)
 
-  // // Set up new rendering pipeline for glow // TODO This is an important visual effect
-  // const pipeline = new BABYLON.DefaultRenderingPipeline("default", true, scene, [camera])
-  // scene.imageProcessingConfiguration.toneMappingEnabled = true
-  // scene.imageProcessingConfiguration.toneMappingType = BABYLON.ImageProcessingConfiguration.TONEMAPPING_ACES
-  // scene.imageProcessingConfiguration.exposure = 3
-  // pipeline.glowLayerEnabled = true
-  // pipeline.glowLayer.intensity = 0.5
+  const light = new BABYLON.HemisphericLight('ambient', new BABYLON.Vector3(0, 1, 0), scene)
+  light.intensity = 0.45
+  const point = new BABYLON.PointLight('center-light', new BABYLON.Vector3(0, 8, 0), scene)
+  point.diffuse = BABYLON.Color3.FromHexString('#8d8cff')
+  point.intensity = 0.55
 
-  const spheres: Sphere[] = []
-  for (let i = 0; i < NUM_SPHERES; i++) {
-    spheres.push(await createSphere(scene, spheres))
+  const glow = new BABYLON.GlowLayer('glow', scene, { blurKernelSize: 32 })
+  glow.intensity = 0.75
+
+  const floor = BABYLON.MeshBuilder.CreateDisc('arena', { radius: 16, tessellation: 80 }, scene)
+  floor.rotation.x = Math.PI / 2
+  floor.position.y = -3.6
+  floor.material = makeMaterial(scene, 'arena-mat', BABYLON.Color3.FromHexString('#202958'), 0.12)
+  floor.isPickable = false
+
+  ;[6, 11, 16].forEach((diameter, index) => {
+    const ring = BABYLON.MeshBuilder.CreateTorus(`arena-ring-${index}`, { diameter: diameter * 2, thickness: 0.025, tessellation: 96 }, scene)
+    ring.position.y = -3.5 + index * 0.025
+    ring.material = makeMaterial(scene, `arena-ring-mat-${index}`, BABYLON.Color3.FromHexString('#5263b7'), 0.2 - index * 0.035)
+    ring.isPickable = false
+  })
+
+  for (let i = 0; i < 90; i += 1) {
+    const star = BABYLON.MeshBuilder.CreateSphere(`star-${i}`, { diameter: 0.025 + Math.random() * 0.045, segments: 3 }, scene)
+    star.position.set((Math.random() - 0.5) * 40, (Math.random() - 0.5) * 22, (Math.random() - 0.5) * 32)
+    star.material = makeMaterial(scene, `star-mat-${i}`, new BABYLON.Color3(0.35 + Math.random() * 0.4, 0.4, 0.8), 0.5)
+    star.isPickable = false
   }
-  // @ts-ignore
-  window.spheres = spheres
 
-  // Target the camera to scene origin
-  camera.setTarget(getAveragePosition(spheres))
-  // Attach the camera to the canvas
-  camera.attachControl(canvas, false)
+  const level = generateLevel()
+  const nodes: Node[] = []
+  const links = new Map<string, Link>()
+  let selected: Node | null = null
+  let status: GameStatus = 'playing'
+  let elapsed = 0
+  let aiTimer = 1.2
+  let disposed = false
 
-  // Glow layer so everything glows
-  const glow = new BABYLON.GlowLayer('glow', scene)
-  glow.intensity = 0.5
+  const drawLabel = (node: Node) => {
+    const context = node.texture.getContext() as unknown as CanvasRenderingContext2D
+    context.clearRect(0, 0, 256, 96)
+    context.textAlign = 'center'
+    context.font = '700 44px Arial'
+    context.fillStyle = '#ffffff'
+    context.shadowColor = '#000000'
+    context.shadowBlur = 8
+    context.fillText(`${Math.floor(node.energy)} / ${node.maxEnergy}`, 128, 59)
+    node.texture.update()
+  }
 
-  // Make highlight layer, for when things are clicked on
-  const highlight = new BABYLON.HighlightLayer('hl1', scene)
+  const recolor = (node: Node) => {
+    node.visual?.dispose()
+    node.visual = undefined
+    node.shell.material?.dispose()
+    node.shell.material = makeMaterial(scene, `shell-${node.id}`, COLORS[node.team], 0.04)
+    node.motes.forEach((mote, index) => {
+      mote.material?.dispose()
+      mote.material = makeMaterial(scene, `strength-mote-mat-${node.id}-${index}`, COLORS[node.team], 0.9)
+    })
+    const expectedTeam = node.team
+    BABYLON.SceneLoader.ImportMeshAsync('', '/', ASSET_FOR_TEAM[expectedTeam], scene).then(result => {
+      if (disposed || node.team !== expectedTeam) {
+        result.meshes.forEach(mesh => mesh.dispose())
+        return
+      }
+      const visual = result.meshes[0]
+      visual.name = `energy-ball-${node.id}`
+      visual.parent = node.root
+      visual.position.setAll(0)
+      visual.computeWorldMatrix(true)
+      result.meshes.forEach(mesh => mesh.computeWorldMatrix(true))
+      const bounds = visual.getHierarchyBoundingVectors(true)
+      const dimensions = bounds.max.subtract(bounds.min)
+      const nativeDiameter = Math.max(dimensions.x, dimensions.y, dimensions.z)
+      if (nativeDiameter > 0) visual.scaling.scaleInPlace(1.9 / nativeDiameter)
+      visual.computeWorldMatrix(true)
+      visual.getChildMeshes(false).forEach(mesh => {
+        mesh.isPickable = false
+        mesh.metadata = { nodeIndex: Number(node.id) }
+        if (expectedTeam === 'neutral') {
+          const material = new BABYLON.PBRMaterial(`neutral-visual-${node.id}-${mesh.name}`, scene)
+          material.albedoColor = COLORS.neutral.scale(0.42)
+          material.emissiveColor = COLORS.neutral.scale(0.55)
+          material.metallic = 0.12
+          material.roughness = 0.48
+          mesh.material = material
+        }
+      })
+      visual.metadata = { nodeIndex: Number(node.id) }
+      node.visual = visual
+    })
+    drawLabel(node)
+  }
 
-  // Get them projectiles set up
-  ammoOrbs.init(scene, PROJECTILE_RATE_MULTIPLIER)
+  level.forEach((data, index) => {
+    const root = BABYLON.MeshBuilder.CreateSphere(`node-${index}`, { diameter: 2.35, segments: 24 }, scene)
+    root.position.set(data.x, data.y, data.z)
+    root.visibility = 0
+    root.metadata = { nodeIndex: index }
 
-  // Focus camera on sphere that's clicked on. Uses ArcRotateCamera
-  scene.onPointerDown = function(_evt, pickInfo) {
-    if (pickInfo.hit && pickInfo.pickedMesh) {
-      const mesh = pickInfo.pickedMesh as BABYLON.Mesh
-      const pickedSphere = mesh.parent!.parent! as Sphere
+    const shell = BABYLON.MeshBuilder.CreateSphere(`shell-${index}`, { diameter: 2.35, segments: 24 }, scene)
+    shell.parent = root
+    shell.metadata = { nodeIndex: index }
+    shell.visibility = 0.12
 
-      if (highlight.hasMesh(mesh)) {
-        highlight.removeMesh(mesh)
-        ammoOrbs.stopFor(pickedSphere)
+    const motes = Array.from({ length: 6 }, (_, moteIndex) => {
+      const mote = BABYLON.MeshBuilder.CreateSphere(`strength-mote-${index}-${moteIndex}`, { diameter: 0.11, segments: 6 }, scene)
+      mote.parent = root
+      mote.material = makeMaterial(scene, `strength-mote-mat-${index}-${moteIndex}`, COLORS[data.team], 0.9)
+      mote.isPickable = false
+      mote.visibility = 0
+      return mote
+    })
+
+    const selectionHalo = BABYLON.MeshBuilder.CreateTorus(`selection-halo-${index}`, { diameter: 2.85, thickness: 0.055, tessellation: 72 }, scene)
+    selectionHalo.parent = root
+    selectionHalo.rotation.x = Math.PI / 2
+    selectionHalo.material = makeMaterial(scene, `selection-halo-mat-${index}`, COLORS.player, 0.9)
+    selectionHalo.isPickable = false
+    selectionHalo.visibility = 0
+
+    const selectionHaloOuter = BABYLON.MeshBuilder.CreateTorus(`selection-halo-outer-${index}`, { diameter: 3.25, thickness: 0.04, tessellation: 72 }, scene)
+    selectionHaloOuter.parent = root
+    selectionHaloOuter.rotation.x = Math.PI / 3
+    selectionHaloOuter.rotation.y = Math.PI / 4
+    selectionHaloOuter.material = makeMaterial(scene, `selection-halo-outer-mat-${index}`, BABYLON.Color3.FromHexString('#9ffff0'), 0.72)
+    selectionHaloOuter.isPickable = false
+    selectionHaloOuter.visibility = 0
+
+    const texture = new BABYLON.DynamicTexture(`label-${index}`, { width: 256, height: 96 }, scene, false)
+    texture.hasAlpha = true
+    const labelMat = new BABYLON.StandardMaterial(`label-mat-${index}`, scene)
+    labelMat.diffuseTexture = texture
+    labelMat.emissiveTexture = texture
+    labelMat.opacityTexture = texture
+    labelMat.disableLighting = true
+    const label = BABYLON.MeshBuilder.CreatePlane(`label-plane-${index}`, { width: 2.25, height: 0.84 }, scene)
+    label.parent = root
+    label.position.y = 1.75
+    label.billboardMode = BABYLON.Mesh.BILLBOARDMODE_ALL
+    label.material = labelMat
+    label.isPickable = false
+
+    const node: Node = {
+      id: String(index), team: data.team, energy: data.energy, maxEnergy: data.max,
+      position: root.position, root, shell, motes, selectionHalo, selectionHaloOuter, selectionFade: 0, outputCursor: 0, orbitPhase: Math.random() * Math.PI * 2, label, texture,
+    }
+    nodes.push(node)
+    recolor(node)
+  })
+
+  const snapshot = () => {
+    const state: GameSnapshot = {
+      playerNodes: nodes.filter(n => n.team === 'player').length,
+      enemyNodes: nodes.filter(n => n.team === 'enemy').length,
+      neutralNodes: nodes.filter(n => n.team === 'neutral').length,
+      status,
+      selected: Boolean(selected),
+    }
+    onUpdate?.(state)
+  }
+
+  const stopLink = (link: Link) => {
+    link.firing = false
+    if (link.units.length === 0) links.delete(link.key)
+  }
+
+  const curveBetween = (from: Node, to: Node) => {
+    const start = from.position.clone()
+    const end = to.position.clone()
+    const middle = BABYLON.Vector3.Center(start, end)
+    middle.y += 0.8 + BABYLON.Vector3.Distance(start, end) * 0.08
+    return BABYLON.Curve3.CreateQuadraticBezier(start, middle, end, 18).getPoints()
+  }
+
+  const createLink = (from: Node, to: Node) => {
+    const key = `${from.id}>${to.id}`
+    const existing = links.get(key)
+    if (existing?.firing) {
+      stopLink(existing)
+      return
+    }
+    const outgoing = Array.from(links.values()).filter(link => link.from === from && link.firing)
+    if (outgoing.length >= 2) stopLink(outgoing[0])
+    const path = curveBetween(from, to)
+    if (existing) {
+      existing.firing = true
+      existing.cooldown = 0
+    } else {
+      links.set(key, { key, from, to, units: [], firing: true, cooldown: 0, path })
+    }
+  }
+
+  const deselect = () => {
+    selected = null
+    snapshot()
+  }
+
+  const captureBurst = (node: Node, team: Exclude<Team, 'neutral'>) => {
+    const color = COLORS[team]
+    const wave = BABYLON.MeshBuilder.CreateSphere(`capture-wave-${node.id}`, { diameter: 2.4, segments: 16 }, scene)
+    wave.position.copyFrom(node.position)
+    wave.material = makeMaterial(scene, `capture-wave-mat-${node.id}`, color, 0.45)
+    wave.isPickable = false
+    const particles = Array.from({ length: 12 }, (_, index) => {
+      const mote = BABYLON.MeshBuilder.CreateSphere(`capture-mote-${index}`, { diameter: 0.1, segments: 5 }, scene)
+      mote.position.copyFrom(node.position)
+      mote.material = makeMaterial(scene, `capture-mote-mat-${node.id}-${index}`, color)
+      mote.metadata = { velocity: new BABYLON.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize().scale(2.2 + Math.random() * 2) }
+      mote.isPickable = false
+      return mote
+    })
+    let life = 0
+    const observer = scene.onBeforeRenderObservable.add(() => {
+      const dt = engine.getDeltaTime() / 1000
+      life += dt
+      wave.scaling.setAll(1 + life * 2.5)
+      wave.visibility = Math.max(0, 1 - life * 1.8)
+      particles.forEach(mote => {
+        mote.position.addInPlace(mote.metadata.velocity.scale(dt))
+        mote.visibility = Math.max(0, 1 - life * 1.5)
+      })
+      if (life > 0.7) {
+        scene.onBeforeRenderObservable.remove(observer)
+        wave.dispose()
+        particles.forEach(mote => mote.dispose())
+      }
+    })
+  }
+
+  const capture = (node: Node, team: Exclude<Team, 'neutral'>) => {
+    node.team = team
+    node.energy = 7
+    recolor(node)
+    captureBurst(node, team)
+    ;Array.from(links.values()).filter(link => link.from === node).forEach(stopLink)
+    snapshot()
+  }
+
+  const createUnitPath = (link: Link) => {
+    const start = link.from.position.clone()
+    const end = link.to.position.clone()
+    const direction = end.subtract(start).normalize()
+    let sideways = BABYLON.Vector3.Cross(direction, new BABYLON.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5))
+    if (sideways.lengthSquared() < 0.01) sideways = BABYLON.Vector3.Cross(direction, BABYLON.Axis.Y)
+    sideways.normalize()
+    const secondAxis = BABYLON.Vector3.Cross(direction, sideways).normalize()
+    const distance = BABYLON.Vector3.Distance(start, end)
+    const middle = BABYLON.Vector3.Center(start, end)
+      .add(sideways.scale((Math.random() - 0.5) * Math.min(4, distance * 0.35)))
+      .add(secondAxis.scale((Math.random() - 0.5) * Math.min(3, distance * 0.25)))
+    return BABYLON.Curve3.CreateQuadraticBezier(start, middle, end, 24).getPoints()
+  }
+
+  const launchUnit = (link: Link) => {
+    const mesh = BABYLON.MeshBuilder.CreateSphere(`unit-${link.key}-${elapsed}`, { diameter: 0.42, segments: 12 }, scene)
+    const path = createUnitPath(link)
+    const pathLength = path.slice(1).reduce((total, point, index) => total + BABYLON.Vector3.Distance(path[index], point), 0)
+    mesh.position.copyFrom(path[0])
+    mesh.material = makeMaterial(scene, `unit-mat-${link.key}-${elapsed}`, COLORS[link.from.team])
+    mesh.isPickable = false
+    mesh.computeWorldMatrix(true)
+    const trail = new BABYLON.TrailMesh(`unit-trail-${link.key}-${elapsed}`, mesh, scene, 0.18, 30, true)
+    trail.material = makeMaterial(scene, `unit-trail-mat-${link.key}-${elapsed}`, COLORS[link.from.team], 0.68)
+    trail.isPickable = false
+    trail.visibility = 0
+    link.units.push({ mesh, trail, path, pathLength, progress: 0, team: link.from.team as Exclude<Team, 'neutral'> })
+  }
+
+  const forwardOverflow = (node: Node) => {
+    const outputs = Array.from(links.values()).filter(link => link.from === node && link.firing)
+    if (outputs.length === 0) return
+    const output = outputs[node.outputCursor % outputs.length]
+    node.outputCursor = (node.outputCursor + 1) % outputs.length
+    launchUnit(output)
+  }
+
+  const deliver = (link: Link, team: Exclude<Team, 'neutral'>) => {
+    if (link.to.team === team) {
+      if (link.to.energy >= link.to.maxEnergy - 0.001) {
+        forwardOverflow(link.to)
       } else {
-        highlight.addMesh(mesh, BABYLON.Color3.White())
+        link.to.energy = Math.min(link.to.maxEnergy, link.to.energy + 1)
+      }
+    } else {
+      link.to.energy -= 1
+      if (link.to.energy <= 0) capture(link.to, team)
+    }
+  }
 
-        // Go through each other sphere
-        // If sphere is highlighted
-        // * start particle emitter towards other sphere
-        // * Remove all highlights
-        spheres.forEach(sphere => {
-          const sphereHighlightedMesh = sphere.getChildMeshes()[3] as BABYLON.Mesh
+  const chooseAiMove = () => {
+    if (status !== 'playing') return
+    const sources = nodes.filter(node => node.team === 'enemy' && node.energy > 20)
+      .sort((a, b) => b.energy - a.energy)
+    const source = sources[0]
+    if (!source) return
+    const targets = nodes.filter(node => node.team !== 'enemy')
+      .sort((a, b) => {
+        const score = (node: Node) => BABYLON.Vector3.Distance(source.position, node.position) + node.energy * 0.09
+        return score(a) - score(b)
+      })
+    const target = targets[0]
+    if (target && !links.has(`${source.id}>${target.id}`)) createLink(source, target)
+  }
 
-          // If this sphere is the clicked sphere
-          if (sphere.name === pickedSphere.name) {
-            return
-          }
+  let hovered: Node | null = null
+  scene.onPointerObservable.add(pointerInfo => {
+    if (pointerInfo.type === BABYLON.PointerEventTypes.POINTERMOVE) {
+      const index = pointerInfo.pickInfo?.pickedMesh?.metadata?.nodeIndex
+      hovered = typeof index === 'number' ? nodes[index] : null
+      canvas.style.cursor = hovered ? 'pointer' : 'grab'
+      return
+    }
+    if (pointerInfo.type !== BABYLON.PointerEventTypes.POINTERPICK || status !== 'playing') return
+    const picked = pointerInfo.pickInfo?.pickedMesh
+    const index = picked?.metadata?.nodeIndex
+    if (typeof index !== 'number') {
+      deselect()
+      return
+    }
+    const node = nodes[index]
+    if (!selected) {
+      if (node.team === 'player') {
+        selected = node
+        snapshot()
+      }
+      return
+    }
+    if (node === selected) {
+      deselect()
+      return
+    }
+    createLink(selected, node)
+    deselect()
+  })
 
-          // If one sphere is clicked then another
-          if (highlight.hasMesh(sphereHighlightedMesh)) {
-            ammoOrbs.start(sphere, pickedSphere, scene)
-            highlight.removeAllMeshes()
+  snapshot()
+  engine.runRenderLoop(() => {
+    const dt = Math.min(engine.getDeltaTime() / 1000, 0.05)
+    elapsed += dt
+    aiTimer -= dt
+
+    if (status === 'playing') {
+      nodes.forEach((node, index) => {
+        if (node.team !== 'neutral') node.energy = Math.min(node.maxEnergy, node.energy + dt * 0.3)
+        const strength = Math.max(0, Math.min(1, node.energy / node.maxEnergy))
+        const baseSize = 0.72 + Math.pow(strength, 0.72) * 0.5
+        const hoverBoost = hovered === node ? 0.07 : 0
+        const pulse = Math.sin(elapsed * (2 + strength * 3) + index) * (0.008 + strength * 0.022)
+        const size = baseSize + hoverBoost
+        node.root.scaling.setAll(size + pulse)
+        node.shell.visibility = 0.025 + strength * 0.2 + Math.max(0, Math.sin(elapsed * 3 + index)) * strength * 0.06
+        node.shell.scaling.setAll(0.98 + strength * 0.35 + Math.sin(elapsed * 2.6 + index) * 0.025)
+        const selectionTarget = selected === node ? 1 : 0
+        const selectionDelta = selectionTarget - node.selectionFade
+        const selectionStep = Math.min(Math.abs(selectionDelta), dt / 0.12)
+        node.selectionFade += Math.sign(selectionDelta) * selectionStep
+        if (node.selectionFade > 0.001) {
+          const easedFade = node.selectionFade * node.selectionFade * (3 - 2 * node.selectionFade)
+          node.selectionHalo.rotation.z += dt * 0.65
+          node.selectionHalo.scaling.setAll(0.92 + easedFade * 0.08 + Math.sin(elapsed * 4) * 0.045 * easedFade)
+          node.selectionHalo.visibility = (0.72 + Math.sin(elapsed * 4) * 0.18) * easedFade
+          node.selectionHaloOuter.rotation.z -= dt * 0.5
+          node.selectionHaloOuter.rotation.y += dt * 0.28
+          node.selectionHaloOuter.scaling.setAll(0.92 + easedFade * 0.08 + Math.sin(elapsed * 4 + Math.PI) * 0.035 * easedFade)
+          node.selectionHaloOuter.visibility = (0.58 + Math.sin(elapsed * 4 + Math.PI) * 0.14) * easedFade
+        } else {
+          node.selectionFade = 0
+          node.selectionHalo.visibility = 0
+          node.selectionHaloOuter.visibility = 0
+        }
+        if (node.visual) node.visual.rotation.y += dt * (0.12 + strength * 0.45)
+        node.orbitPhase += dt * (0.65 + strength * 0.9)
+        node.motes.forEach((mote, moteIndex) => {
+          const threshold = (moteIndex + 1) / (node.motes.length + 1)
+          mote.visibility = strength >= threshold ? Math.min(1, (strength - threshold) * 7) : 0
+          const angle = node.orbitPhase + moteIndex * Math.PI * 2 / node.motes.length
+          const radius = 1.25 + strength * 0.45 + (moteIndex % 2) * 0.13
+          mote.position.set(
+            Math.cos(angle) * radius,
+            Math.sin(angle * 1.35) * 0.52,
+            Math.sin(angle) * radius,
+          )
+          mote.scaling.setAll(0.75 + strength * 0.65 + Math.sin(elapsed * 6 + moteIndex) * 0.12)
+        })
+        node.label.position.y = 1.75 + strength * 0.25 + Math.sin(elapsed * 1.6 + index) * 0.06
+      })
+
+      ;Array.from(links.values()).forEach(link => {
+        link.units.slice().forEach(unit => {
+          const projectileSpeed = 15
+          unit.progress += dt * projectileSpeed / unit.pathLength
+          const exactIndex = unit.progress * (unit.path.length - 1)
+          const index = Math.min(unit.path.length - 2, Math.floor(exactIndex))
+          const fraction = exactIndex - index
+          unit.mesh.position.copyFrom(BABYLON.Vector3.Lerp(unit.path[index], unit.path[index + 1], fraction))
+          unit.mesh.rotation.y += dt * 7
+          if (unit.progress > 0.05) unit.trail.visibility = 1
+          if (unit.progress >= 1) {
+            unit.trail.dispose()
+            unit.mesh.dispose()
+            link.units.splice(link.units.indexOf(unit), 1)
+            deliver(link, unit.team)
+            if (!link.firing && link.units.length === 0) links.delete(link.key)
           }
         })
+
+        if (!link.firing || link.from.team === 'neutral' || link.from.energy <= 0) return
+        link.cooldown += dt
+        const fireInterval = getFireInterval(link.from)
+        if (link.cooldown >= fireInterval) {
+          link.cooldown -= fireInterval
+          launchUnit(link)
+        }
+      })
+
+      if (aiTimer <= 0) {
+        aiTimer = 2.2
+        chooseAiMove()
       }
+      const playerCount = nodes.filter(node => node.team === 'player').length
+      const enemyCount = nodes.filter(node => node.team === 'enemy').length
+      if (enemyCount === 0) status = 'won'
+      if (playerCount === 0) status = 'lost'
+      if (status !== 'playing') {
+        deselect()
+        snapshot()
+      }
+      if (Math.floor(elapsed * 4) !== Math.floor((elapsed - dt) * 4)) nodes.forEach(drawLabel)
     }
-  }
-
-  // Return the created scene
-  return scene
-}
-const game = async (canvas: HTMLCanvasElement) => {
-  // Load the 3D engine
-  const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true })
-  // CreateScene function that creates and return the scene
-
-  // call the createScene function
-  const scene = await createScene(engine, canvas)
-
-  // run the render loop
-  engine.runRenderLoop(function() {
     scene.render()
   })
+
+  const resize = () => engine.resize()
+  window.addEventListener('resize', resize)
+
+  return () => {
+    if (disposed) return
+    disposed = true
+    window.removeEventListener('resize', resize)
+    engine.stopRenderLoop()
+    scene.dispose()
+    engine.dispose()
+  }
 }
 
 export default game
