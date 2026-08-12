@@ -199,6 +199,39 @@ const game = (canvas: HTMLCanvasElement, onUpdate?: (state: GameSnapshot) => voi
   let elapsed = 0
   let aiTimer = 1.2
   let disposed = false
+  const modelCache = {} as Record<Team, Promise<BABYLON.AbstractMesh>>
+
+  const getModelPrototype = (team: Team) => {
+    if (!modelCache[team]) {
+      modelCache[team] = BABYLON.SceneLoader.ImportMeshAsync('', '/', ASSET_FOR_TEAM[team], scene).then(result => {
+        const prototype = result.meshes[0]
+        prototype.computeWorldMatrix(true)
+        result.meshes.forEach(mesh => mesh.computeWorldMatrix(true))
+        const bounds = prototype.getHierarchyBoundingVectors(true)
+        const dimensions = bounds.max.subtract(bounds.min)
+        const nativeDiameter = Math.max(dimensions.x, dimensions.y, dimensions.z)
+        if (nativeDiameter > 0) prototype.scaling.scaleInPlace(1.9 / nativeDiameter)
+        prototype.computeWorldMatrix(true)
+        prototype.getChildMeshes(false).forEach(mesh => {
+          mesh.isPickable = false
+          if (team === 'neutral') {
+            const material = new BABYLON.PBRMaterial(`neutral-prototype-${mesh.name}`, scene)
+            material.albedoColor = COLORS.neutral.scale(0.42)
+            material.emissiveColor = COLORS.neutral.scale(0.55)
+            material.metallic = 0.12
+            material.roughness = 0.48
+            mesh.material = material
+          }
+        })
+        prototype.setEnabled(false)
+        return prototype
+      })
+    }
+    return modelCache[team]
+  }
+
+  // Start parsing all three models during scene setup, before any captures occur.
+  ;(['player', 'enemy', 'neutral'] as Team[]).forEach(getModelPrototype)
 
   const drawLabel = (node: Node) => {
     const context = node.texture.getContext() as unknown as CanvasRenderingContext2D
@@ -222,33 +255,15 @@ const game = (canvas: HTMLCanvasElement, onUpdate?: (state: GameSnapshot) => voi
       mote.material = makeMaterial(scene, `strength-mote-mat-${node.id}-${index}`, COLORS[node.team], 0.9)
     })
     const expectedTeam = node.team
-    BABYLON.SceneLoader.ImportMeshAsync('', '/', ASSET_FOR_TEAM[expectedTeam], scene).then(result => {
-      if (disposed || node.team !== expectedTeam) {
-        result.meshes.forEach(mesh => mesh.dispose())
-        return
-      }
-      const visual = result.meshes[0]
-      visual.name = `energy-ball-${node.id}`
+    getModelPrototype(expectedTeam).then(prototype => {
+      if (disposed || node.team !== expectedTeam) return
+      const visual = prototype.clone(`energy-ball-${node.id}`, null, false)!
+      visual.setEnabled(true)
       visual.parent = node.root
       visual.position.setAll(0)
-      visual.computeWorldMatrix(true)
-      result.meshes.forEach(mesh => mesh.computeWorldMatrix(true))
-      const bounds = visual.getHierarchyBoundingVectors(true)
-      const dimensions = bounds.max.subtract(bounds.min)
-      const nativeDiameter = Math.max(dimensions.x, dimensions.y, dimensions.z)
-      if (nativeDiameter > 0) visual.scaling.scaleInPlace(1.9 / nativeDiameter)
-      visual.computeWorldMatrix(true)
       visual.getChildMeshes(false).forEach(mesh => {
         mesh.isPickable = false
         mesh.metadata = { nodeIndex: Number(node.id) }
-        if (expectedTeam === 'neutral') {
-          const material = new BABYLON.PBRMaterial(`neutral-visual-${node.id}-${mesh.name}`, scene)
-          material.albedoColor = COLORS.neutral.scale(0.42)
-          material.emissiveColor = COLORS.neutral.scale(0.55)
-          material.metallic = 0.12
-          material.roughness = 0.48
-          mesh.material = material
-        }
       })
       visual.metadata = { nodeIndex: Number(node.id) }
       node.visual = visual
@@ -439,7 +454,31 @@ const game = (canvas: HTMLCanvasElement, onUpdate?: (state: GameSnapshot) => voi
     launchUnit(output)
   }
 
-  const deliver = (link: Link, team: Exclude<Team, 'neutral'>) => {
+  const createImpact = (link: Link, team: Exclude<Team, 'neutral'>, position: BABYLON.Vector3) => {
+    const impact = BABYLON.MeshBuilder.CreateSphere(`impact-${link.key}-${elapsed}`, { diameter: 0.28, segments: 8 }, scene)
+    impact.position.copyFrom(position)
+    impact.material = makeMaterial(scene, `impact-mat-${link.key}-${elapsed}`, COLORS[team], 0.9)
+    impact.isPickable = false
+
+    const frameRate = 60
+    const scaleAnimation = new BABYLON.Animation('impact-scale', 'scaling', frameRate, BABYLON.Animation.ANIMATIONTYPE_VECTOR3)
+    scaleAnimation.setKeys([
+      { frame: 0, value: new BABYLON.Vector3(0.45, 0.45, 0.45) },
+      { frame: 4, value: new BABYLON.Vector3(1.35, 1.35, 1.35) },
+      { frame: 11, value: new BABYLON.Vector3(2.1, 2.1, 2.1) },
+    ])
+    const fadeAnimation = new BABYLON.Animation('impact-fade', 'visibility', frameRate, BABYLON.Animation.ANIMATIONTYPE_FLOAT)
+    fadeAnimation.setKeys([
+      { frame: 0, value: 1 },
+      { frame: 4, value: 0.85 },
+      { frame: 11, value: 0 },
+    ])
+    impact.animations = [scaleAnimation, fadeAnimation]
+    scene.beginAnimation(impact, 0, 11, false, 1, () => impact.dispose())
+  }
+
+  const deliver = (link: Link, team: Exclude<Team, 'neutral'>, impactPosition: BABYLON.Vector3) => {
+    createImpact(link, team, impactPosition)
     if (link.to.team === team) {
       if (link.to.energy >= link.to.maxEnergy - 0.001) {
         forwardOverflow(link.to)
@@ -560,11 +599,18 @@ const game = (canvas: HTMLCanvasElement, onUpdate?: (state: GameSnapshot) => voi
           unit.mesh.position.copyFrom(BABYLON.Vector3.Lerp(unit.path[index], unit.path[index + 1], fraction))
           unit.mesh.rotation.y += dt * 7
           if (unit.progress > 0.05) unit.trail.visibility = 1
-          if (unit.progress >= 1) {
+          const toTarget = link.to.position.subtract(unit.mesh.position)
+          const visibleBlobRadius = 0.66 * link.to.root.scaling.x
+          const contactRadius = Math.max(0.55, visibleBlobRadius)
+          const hasHitSurface = toTarget.length() <= contactRadius
+          if (hasHitSurface || unit.progress >= 1) {
+            const approach = unit.mesh.position.subtract(link.to.position).normalize()
+            const impactPosition = link.to.position.add(approach.scale(contactRadius))
+            unit.mesh.position.copyFrom(impactPosition)
             unit.trail.dispose()
             unit.mesh.dispose()
             link.units.splice(link.units.indexOf(unit), 1)
-            deliver(link, unit.team)
+            deliver(link, unit.team, impactPosition)
             if (!link.firing && link.units.length === 0) links.delete(link.key)
           }
         })
