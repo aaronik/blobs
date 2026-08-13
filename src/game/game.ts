@@ -1,5 +1,6 @@
 import * as BABYLON from 'babylonjs'
 import 'babylonjs-loaders'
+import { BotAction, BotRuntime, BotSide, BotState, ControllerConfig } from './bots'
 
 export type GameStatus = 'playing' | 'won' | 'lost'
 export type GameSnapshot = {
@@ -26,6 +27,7 @@ type Node = {
   selectionHaloOuter: BABYLON.Mesh
   selectionFade: number
   outputCursor: number
+  fireCooldown: number
   orbitPhase: number
   label: BABYLON.Mesh
   texture: BABYLON.DynamicTexture
@@ -46,7 +48,6 @@ type Link = {
   to: Node
   units: ConnectionUnit[]
   firing: boolean
-  cooldown: number
   path: BABYLON.Vector3[]
 }
 
@@ -132,13 +133,24 @@ const makeMaterial = (scene: BABYLON.Scene, name: string, color: BABYLON.Color3,
 }
 
 const getFireInterval = (node: Node) => {
-  const strength = Math.max(0, Math.min(1, node.energy / node.maxEnergy))
+  const strength = Math.max(0, Math.min(1, node.energy / 200))
   const baseInterval = 1.3 - Math.pow(strength, 0.7) * 1.05
   const lowEnergyPenalty = node.energy <= 6 ? (7 - node.energy) * 0.12 : 0
   return Math.max(0.22, baseInterval + lowEnergyPenalty)
 }
 
-const game = (canvas: HTMLCanvasElement, onUpdate?: (state: GameSnapshot) => void) => {
+export type GameOptions = {
+  onUpdate?: (state: GameSnapshot) => void
+  controllers?: Record<BotSide, ControllerConfig>
+  getTimeScale?: () => number
+}
+
+const game = (canvas: HTMLCanvasElement, options: GameOptions = {}) => {
+  const onUpdate = options.onUpdate
+  const controllers: Record<BotSide, ControllerConfig> = options.controllers || {
+    player: { kind: 'human', name: 'Human' },
+    enemy: { kind: 'default', name: 'Default AI' },
+  }
   const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true })
   const scene = new BABYLON.Scene(engine)
   scene.clearColor = new BABYLON.Color4(0.018, 0.025, 0.065, 1)
@@ -198,7 +210,13 @@ const game = (canvas: HTMLCanvasElement, onUpdate?: (state: GameSnapshot) => voi
   let status: GameStatus = 'playing'
   let elapsed = 0
   let aiTimer = 1.2
+  let botDecisionPending = false
   let disposed = false
+  const botRuntimes: Partial<Record<BotSide, BotRuntime>> = {}
+  ;(['player', 'enemy'] as BotSide[]).forEach(side => {
+    const controller = controllers[side]
+    if (controller.kind === 'bot') botRuntimes[side] = new BotRuntime(controller.source, controller.name)
+  })
   const modelCache = {} as Record<Team, Promise<BABYLON.AbstractMesh>>
 
   const getModelPrototype = (team: Team) => {
@@ -322,7 +340,7 @@ const game = (canvas: HTMLCanvasElement, onUpdate?: (state: GameSnapshot) => voi
 
     const node: Node = {
       id: String(index), team: data.team, energy: data.energy, maxEnergy: data.max,
-      position: root.position, root, shell, motes, selectionHalo, selectionHaloOuter, selectionFade: 0, outputCursor: 0, orbitPhase: Math.random() * Math.PI * 2, label, texture,
+      position: root.position, root, shell, motes, selectionHalo, selectionHaloOuter, selectionFade: 0, outputCursor: 0, fireCooldown: 0, orbitPhase: Math.random() * Math.PI * 2, label, texture,
     }
     nodes.push(node)
     recolor(node)
@@ -352,22 +370,24 @@ const game = (canvas: HTMLCanvasElement, onUpdate?: (state: GameSnapshot) => voi
     return BABYLON.Curve3.CreateQuadraticBezier(start, middle, end, 18).getPoints()
   }
 
-  const createLink = (from: Node, to: Node) => {
+  const startLink = (from: Node, to: Node) => {
     const key = `${from.id}>${to.id}`
     const existing = links.get(key)
-    if (existing?.firing) {
-      stopLink(existing)
-      return
-    }
+    if (existing?.firing) return
     const outgoing = Array.from(links.values()).filter(link => link.from === from && link.firing)
     if (outgoing.length >= 2) stopLink(outgoing[0])
     const path = curveBetween(from, to)
     if (existing) {
       existing.firing = true
-      existing.cooldown = 0
     } else {
-      links.set(key, { key, from, to, units: [], firing: true, cooldown: 0, path })
+      links.set(key, { key, from, to, units: [], firing: true, path })
     }
+  }
+
+  const toggleLink = (from: Node, to: Node) => {
+    const existing = links.get(`${from.id}>${to.id}`)
+    if (existing?.firing) stopLink(existing)
+    else startLink(from, to)
   }
 
   const deselect = () => {
@@ -491,19 +511,60 @@ const game = (canvas: HTMLCanvasElement, onUpdate?: (state: GameSnapshot) => voi
     }
   }
 
-  const chooseAiMove = () => {
-    if (status !== 'playing') return
-    const sources = nodes.filter(node => node.team === 'enemy' && node.energy > 20)
+  const applyAction = (side: BotSide, action: BotAction) => {
+    if (!action || !['send', 'stop'].includes(action.type) || action.from === action.to) return
+    const from = nodes.find(node => node.id === String(action.from))
+    const to = nodes.find(node => node.id === String(action.to))
+    if (!from || !to || from.team !== side) return
+    const existing = links.get(`${from.id}>${to.id}`)
+    if (action.type === 'stop') {
+      if (existing?.firing) stopLink(existing)
+    } else startLink(from, to)
+  }
+
+  const chooseDefaultMove = (side: BotSide) => {
+    const sources = nodes.filter(node => node.team === side && node.energy > 20)
       .sort((a, b) => b.energy - a.energy)
     const source = sources[0]
     if (!source) return
-    const targets = nodes.filter(node => node.team !== 'enemy')
+    const targets = nodes.filter(node => node.team !== side)
       .sort((a, b) => {
         const score = (node: Node) => BABYLON.Vector3.Distance(source.position, node.position) + node.energy * 0.09
         return score(a) - score(b)
       })
-    const target = targets[0]
-    if (target && !links.has(`${source.id}>${target.id}`)) createLink(source, target)
+    if (targets[0]) startLink(source, targets[0])
+  }
+
+  const createBotState = (side: BotSide): BotState => ({
+    side,
+    time: elapsed,
+    nodes: nodes.map(node => ({
+      id: node.id,
+      team: node.team,
+      energy: node.energy,
+      maxEnergy: node.maxEnergy,
+      position: { x: node.position.x, y: node.position.y, z: node.position.z },
+    })),
+    links: Array.from(links.values()).map(link => ({ from: link.from.id, to: link.to.id, active: link.firing })),
+  })
+
+  const runControllerTurns = async () => {
+    if (status !== 'playing' || botDecisionPending) return
+    botDecisionPending = true
+    try {
+      for (const side of ['player', 'enemy'] as BotSide[]) {
+        const controller = controllers[side]
+        if (controller.kind === 'default') chooseDefaultMove(side)
+        if (controller.kind === 'bot') {
+          const actions = await botRuntimes[side]?.decide(createBotState(side)) || []
+          actions.forEach(action => applyAction(side, action))
+        }
+      }
+    } catch (error) {
+      console.error('[Bot] Controller turn failed:', error)
+    } finally {
+      botDecisionPending = false
+    }
   }
 
   let hovered: Node | null = null
@@ -523,7 +584,7 @@ const game = (canvas: HTMLCanvasElement, onUpdate?: (state: GameSnapshot) => voi
     }
     const node = nodes[index]
     if (!selected) {
-      if (node.team === 'player') {
+      if (node.team === 'player' && controllers.player.kind === 'human') {
         selected = node
         snapshot()
       }
@@ -533,13 +594,15 @@ const game = (canvas: HTMLCanvasElement, onUpdate?: (state: GameSnapshot) => voi
       deselect()
       return
     }
-    createLink(selected, node)
+    toggleLink(selected, node)
     deselect()
   })
 
   snapshot()
   engine.runRenderLoop(() => {
-    const dt = Math.min(engine.getDeltaTime() / 1000, 0.05)
+    const realDt = Math.min(engine.getDeltaTime() / 1000, 0.05)
+    const timeScale = Math.max(1, Math.min(10, options.getTimeScale?.() || 1))
+    const dt = realDt * timeScale
     elapsed += dt
     aiTimer -= dt
 
@@ -614,19 +677,27 @@ const game = (canvas: HTMLCanvasElement, onUpdate?: (state: GameSnapshot) => voi
             if (!link.firing && link.units.length === 0) links.delete(link.key)
           }
         })
+      })
 
-        if (!link.firing || link.from.team === 'neutral' || link.from.energy <= 0) return
-        link.cooldown += dt
-        const fireInterval = getFireInterval(link.from)
-        if (link.cooldown >= fireInterval) {
-          link.cooldown -= fireInterval
-          launchUnit(link)
+      nodes.forEach(node => {
+        const outputs = Array.from(links.values()).filter(link => link.from === node && link.firing)
+        if (outputs.length === 0 || node.team === 'neutral' || node.energy <= 0) {
+          node.fireCooldown = 0
+          return
+        }
+        node.fireCooldown += dt
+        const fireInterval = getFireInterval(node)
+        while (node.fireCooldown >= fireInterval) {
+          node.fireCooldown -= fireInterval
+          const output = outputs[node.outputCursor % outputs.length]
+          node.outputCursor = (node.outputCursor + 1) % outputs.length
+          launchUnit(output)
         }
       })
 
       if (aiTimer <= 0) {
-        aiTimer = 2.2
-        chooseAiMove()
+        aiTimer = 1.25
+        void runControllerTurns()
       }
       const playerCount = nodes.filter(node => node.team === 'player').length
       const enemyCount = nodes.filter(node => node.team === 'enemy').length
@@ -648,6 +719,7 @@ const game = (canvas: HTMLCanvasElement, onUpdate?: (state: GameSnapshot) => voi
     if (disposed) return
     disposed = true
     window.removeEventListener('resize', resize)
+    Object.values(botRuntimes).forEach(runtime => runtime?.dispose())
     engine.stopRenderLoop()
     scene.dispose()
     engine.dispose()
