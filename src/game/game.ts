@@ -143,6 +143,7 @@ const getFireInterval = (node: Node) => {
 
 export type GameOptions = {
   onUpdate?: (state: GameSnapshot) => void
+  onBotLearning?: (botId: string, data: unknown) => void
   controllers?: Record<BotSide, ControllerConfig>
   getTimeScale?: () => number
 }
@@ -227,11 +228,12 @@ const game = (canvas: HTMLCanvasElement, options: GameOptions = {}) => {
   let elapsed = 0
   let aiTimer = 1.2
   let botDecisionPending = false
+  let learningFinalized = false
   let disposed = false
   const botRuntimes: Partial<Record<BotSide, BotRuntime>> = {}
   ;(['player', 'enemy'] as BotSide[]).forEach(side => {
     const controller = controllers[side]
-    if (controller.kind === 'bot') botRuntimes[side] = new BotRuntime(controller.source, controller.name)
+    if (controller.kind === 'bot') botRuntimes[side] = new BotRuntime(controller.source, controller.name, controller.learningData)
   })
   const modelCache = {} as Record<Team, Promise<BABYLON.AbstractMesh>>
 
@@ -763,6 +765,17 @@ const game = (canvas: HTMLCanvasElement, options: GameOptions = {}) => {
       if (status !== 'playing') {
         deselect()
         snapshot()
+        if (!learningFinalized) {
+          learningFinalized = true
+          ;(['player', 'enemy'] as BotSide[]).forEach(side => {
+            const controller = controllers[side]
+            if (controller.kind !== 'bot' || !controller.id) return
+            const outcome = (side === 'player' && status === 'won') || (side === 'enemy' && status === 'lost') ? 'won' : 'lost'
+            void botRuntimes[side]?.finish(outcome, createBotState(side)).then(data => {
+              if (data !== undefined) options.onBotLearning?.(controller.id!, data)
+            })
+          })
+        }
       }
       if (Math.floor(elapsed * 4) !== Math.floor((elapsed - dt) * 4)) nodes.forEach(drawLabel)
     }

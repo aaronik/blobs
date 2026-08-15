@@ -9,6 +9,11 @@ const initialState: GameSnapshot = { playerNodes: 1, enemyNodes: 1, neutralNodes
 const BOT_STORAGE_KEY = 'neural-front-bots'
 const PLAYER_CONTROLLER_KEY = 'neural-front-player-controller'
 const ENEMY_CONTROLLER_KEY = 'neural-front-enemy-controller'
+const LEARNING_STORAGE_PREFIX = 'neural-front-learning-v1:'
+
+const loadLearning = (id: string): unknown => {
+  try { return JSON.parse(localStorage.getItem(`${LEARNING_STORAGE_PREFIX}${id}`) || 'null') } catch { return undefined }
+}
 
 const loadControllerChoice = (key: string, fallback: string) => {
   try { return localStorage.getItem(key) || fallback } catch { return fallback }
@@ -77,22 +82,31 @@ function App() {
     debugWasAtBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 24
   }
 
-  const resolveController = useCallback((choice: string, humanAllowed: boolean): ControllerConfig => {
+  const resolveController = useCallback((choice: string, humanAllowed: boolean, side: 'player' | 'enemy'): ControllerConfig => {
     if (choice === 'human' && humanAllowed) return { kind: 'human', name: 'Human' }
     if (choice === 'default') return { kind: 'default', name: 'Default AI' }
     const bot = allBots.find(item => item.id === choice.replace('bot:', ''))
-    return bot ? { kind: 'bot', name: bot.name, source: bot.source } : { kind: 'default', name: 'Default AI' }
+    const learningId = bot ? `${bot.id}:${side}` : ''
+    return bot ? { kind: 'bot', id: learningId, name: bot.name, source: bot.source, learningData: loadLearning(learningId) } : { kind: 'default', name: 'Default AI' }
   }, [allBots])
 
   const controllers = useMemo(() => ({
-    player: resolveController(playerChoice, true),
-    enemy: resolveController(enemyChoice, false),
+    player: resolveController(playerChoice, true, 'player'),
+    enemy: resolveController(enemyChoice, false, 'enemy'),
   }), [playerChoice, enemyChoice, resolveController])
+
+  const onBotLearning = useCallback((botId: string, data: unknown) => {
+    try {
+      localStorage.setItem(`${LEARNING_STORAGE_PREFIX}${botId}`, JSON.stringify(data))
+    } catch (error) {
+      console.error('Could not persist bot learning:', error)
+    }
+  }, [])
 
   const onCanvas = useCallback((canvas: HTMLCanvasElement) => {
     canvas.focus()
-    return game(canvas, { onUpdate: setState, controllers, getTimeScale: () => timeScaleRef.current })
-  }, [controllers])
+    return game(canvas, { onUpdate: setState, onBotLearning, controllers, getTimeScale: () => timeScaleRef.current })
+  }, [controllers, onBotLearning])
 
   const releaseTimeScale = useCallback(() => {
     timeScaleRef.current = 1

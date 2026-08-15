@@ -25,12 +25,17 @@ export type BotState = {
 export type ControllerConfig =
   | { kind: 'human'; name: string }
   | { kind: 'default'; name: string }
-  | { kind: 'bot'; name: string; source: string }
+  | { kind: 'bot'; id?: string; name: string; source: string; learningData?: unknown }
 
 export type SavedBot = { id: string; name: string; source: string; builtIn?: boolean }
 
+export type BotLearningUpdate = { botId: string; data: unknown }
+
 const workerScript = `
 let decide;
+let learn;
+let finish;
+let exportLearning;
 let sourceName = 'bot.js';
 const serialize = value => {
   try { return typeof value === 'string' ? value : JSON.stringify(value, null, 2); }
@@ -40,17 +45,27 @@ const serialize = value => {
   console[level] = (...args) => self.postMessage({ type: 'log', level, message: args.map(serialize).join(' ') });
 });
 self.onmessage = async (event) => {
-  const { type, id, source, state, filename } = event.data;
+  const { type, id, source, state, filename, learningData, outcome } = event.data;
   try {
     if (type === 'init') {
       sourceName = filename || 'bot.js';
-      const moduleSource = source + '\\nexport { decide };\\n//# sourceURL=' + sourceName;
+      const moduleSource = source + '\\nexport { decide };\\nexport const botLearn = typeof learn === "function" ? learn : undefined;\\nexport const botFinish = typeof finish === "function" ? finish : undefined;\\nexport const botExportLearning = typeof exportLearning === "function" ? exportLearning : undefined;\\n//# sourceURL=' + sourceName;
       const encodedSource = btoa(unescape(encodeURIComponent(moduleSource)));
       const moduleUrl = 'data:text/javascript;base64,' + encodedSource;
       const module = await import(moduleUrl);
       decide = module.decide;
+      learn = module.botLearn;
+      finish = module.botFinish;
+      exportLearning = module.botExportLearning;
       if (!decide) throw new Error('Define function decide(state)');
+      if (learn) await learn(learningData);
       self.postMessage({ type: 'ready', id });
+      return;
+    }
+    if (type === 'finish') {
+      if (finish) await finish(outcome, state);
+      const data = exportLearning ? await exportLearning() : undefined;
+      self.postMessage({ type: 'learning', id, data });
       return;
     }
     const result = await decide(state);
@@ -78,7 +93,7 @@ export class BotRuntime {
   private ready = false
   private failed = false
 
-  constructor(source: string, private name = 'Bot') {
+  constructor(source: string, private name = 'Bot', learningData?: unknown) {
     const url = URL.createObjectURL(new Blob([workerScript], { type: 'text/javascript' }))
     this.worker = new Worker(url)
     URL.revokeObjectURL(url)
@@ -93,7 +108,7 @@ export class BotRuntime {
       }
     }
     const filename = `${this.name.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'bot'}.js`
-    this.worker.postMessage({ type: 'init', id: 0, source, filename })
+    this.worker.postMessage({ type: 'init', id: 0, source, filename, learningData })
   }
 
   decide(state: BotState, timeoutMs = 500): Promise<BotAction[]> {
@@ -123,6 +138,26 @@ export class BotRuntime {
       }
       worker.addEventListener('message', listener)
       worker.postMessage({ type: 'decide', id, state })
+    })
+  }
+
+  finish(outcome: 'won' | 'lost', state: BotState, timeoutMs = 1000): Promise<unknown> {
+    if (!this.worker || !this.ready || this.failed) return Promise.resolve(undefined)
+    const id = ++this.requestId
+    return new Promise(resolve => {
+      const worker = this.worker!
+      const timeout = window.setTimeout(() => {
+        worker.removeEventListener('message', listener)
+        resolve(undefined)
+      }, timeoutMs)
+      const listener = (event: MessageEvent) => {
+        if (event.data.id !== id || !['learning', 'error'].includes(event.data.type)) return
+        window.clearTimeout(timeout)
+        worker.removeEventListener('message', listener)
+        resolve(event.data.type === 'learning' ? event.data.data : undefined)
+      }
+      worker.addEventListener('message', listener)
+      worker.postMessage({ type: 'finish', id, outcome, state })
     })
   }
 
