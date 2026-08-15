@@ -18,6 +18,8 @@ type Node = {
   team: Team
   energy: number
   maxEnergy: number
+  neutralInfluence: number
+  neutralResistance: number
   position: BABYLON.Vector3
   root: BABYLON.Mesh
   shell: BABYLON.Mesh
@@ -110,7 +112,7 @@ const generateLevel = (): LevelNode[] => {
     const team: Team = index === 0 ? 'player' : index === count - 1 ? 'enemy' : 'neutral'
     const max = team === 'neutral' ? randomInt(45, 200) : teamMax
     const energy = team === 'neutral'
-      ? Math.max(12, Math.round(max * (0.28 + Math.random() * 0.18)))
+      ? max
       : teamStartingEnergy
     return {
       x: position.x,
@@ -182,6 +184,20 @@ const game = (canvas: HTMLCanvasElement, options: GameOptions = {}) => {
 
   const glow = new BABYLON.GlowLayer('glow', scene, { blurKernelSize: 32 })
   glow.intensity = 0.75
+
+  type CombatTeam = Exclude<Team, 'neutral'>
+  const projectileMaterials = {} as Record<CombatTeam, BABYLON.StandardMaterial>
+  const trailMaterials = {} as Record<CombatTeam, BABYLON.StandardMaterial>
+  const impactMaterials = {} as Record<CombatTeam, BABYLON.StandardMaterial>
+  const captureWaveMaterials = {} as Record<CombatTeam, BABYLON.StandardMaterial>
+  const captureMoteMaterials = {} as Record<CombatTeam, BABYLON.StandardMaterial>
+  ;(['player', 'enemy'] as CombatTeam[]).forEach(team => {
+    projectileMaterials[team] = makeMaterial(scene, `unit-mat-${team}`, COLORS[team])
+    trailMaterials[team] = makeMaterial(scene, `unit-trail-mat-${team}`, COLORS[team], 0.68)
+    impactMaterials[team] = makeMaterial(scene, `impact-mat-${team}`, COLORS[team], 0.9)
+    captureWaveMaterials[team] = makeMaterial(scene, `capture-wave-mat-${team}`, COLORS[team], 0.45)
+    captureMoteMaterials[team] = makeMaterial(scene, `capture-mote-mat-${team}`, COLORS[team])
+  })
 
   const floor = BABYLON.MeshBuilder.CreateDisc('arena', { radius: 16, tessellation: 80 }, scene)
   floor.rotation.x = Math.PI / 2
@@ -282,9 +298,13 @@ const game = (canvas: HTMLCanvasElement, options: GameOptions = {}) => {
       visual.getChildMeshes(false).forEach(mesh => {
         mesh.isPickable = false
         mesh.metadata = { nodeIndex: Number(node.id) }
+        if (expectedTeam === 'neutral' && mesh.material) {
+          mesh.material = mesh.material.clone(`neutral-node-mat-${node.id}-${mesh.name}`)
+        }
       })
       visual.metadata = { nodeIndex: Number(node.id) }
       node.visual = visual
+      if (expectedTeam === 'neutral') updateNeutralTint(node)
     })
     drawLabel(node)
   }
@@ -340,6 +360,7 @@ const game = (canvas: HTMLCanvasElement, options: GameOptions = {}) => {
 
     const node: Node = {
       id: String(index), team: data.team, energy: data.energy, maxEnergy: data.max,
+      neutralInfluence: 0, neutralResistance: data.energy,
       position: root.position, root, shell, motes, selectionHalo, selectionHaloOuter, selectionFade: 0, outputCursor: 0, fireCooldown: 0, orbitPhase: Math.random() * Math.PI * 2, label, texture,
     }
     nodes.push(node)
@@ -396,15 +417,14 @@ const game = (canvas: HTMLCanvasElement, options: GameOptions = {}) => {
   }
 
   const captureBurst = (node: Node, team: Exclude<Team, 'neutral'>) => {
-    const color = COLORS[team]
     const wave = BABYLON.MeshBuilder.CreateSphere(`capture-wave-${node.id}`, { diameter: 2.4, segments: 16 }, scene)
     wave.position.copyFrom(node.position)
-    wave.material = makeMaterial(scene, `capture-wave-mat-${node.id}`, color, 0.45)
+    wave.material = captureWaveMaterials[team]
     wave.isPickable = false
     const particles = Array.from({ length: 12 }, (_, index) => {
       const mote = BABYLON.MeshBuilder.CreateSphere(`capture-mote-${index}`, { diameter: 0.1, segments: 5 }, scene)
       mote.position.copyFrom(node.position)
-      mote.material = makeMaterial(scene, `capture-mote-mat-${node.id}-${index}`, color)
+      mote.material = captureMoteMaterials[team]
       mote.metadata = { velocity: new BABYLON.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize().scale(2.2 + Math.random() * 2) }
       mote.isPickable = false
       return mote
@@ -456,11 +476,11 @@ const game = (canvas: HTMLCanvasElement, options: GameOptions = {}) => {
     const path = createUnitPath(link)
     const pathLength = path.slice(1).reduce((total, point, index) => total + BABYLON.Vector3.Distance(path[index], point), 0)
     mesh.position.copyFrom(path[0])
-    mesh.material = makeMaterial(scene, `unit-mat-${link.key}-${elapsed}`, COLORS[link.from.team])
+    mesh.material = projectileMaterials[link.from.team as CombatTeam]
     mesh.isPickable = false
     mesh.computeWorldMatrix(true)
     const trail = new BABYLON.TrailMesh(`unit-trail-${link.key}-${elapsed}`, mesh, scene, 0.18, 30, true)
-    trail.material = makeMaterial(scene, `unit-trail-mat-${link.key}-${elapsed}`, COLORS[link.from.team], 0.68)
+    trail.material = trailMaterials[link.from.team as CombatTeam]
     trail.isPickable = false
     trail.visibility = 0
     link.units.push({ mesh, trail, path, pathLength, progress: 0, team: link.from.team as Exclude<Team, 'neutral'> })
@@ -477,7 +497,7 @@ const game = (canvas: HTMLCanvasElement, options: GameOptions = {}) => {
   const createImpact = (link: Link, team: Exclude<Team, 'neutral'>, position: BABYLON.Vector3) => {
     const impact = BABYLON.MeshBuilder.CreateSphere(`impact-${link.key}-${elapsed}`, { diameter: 0.28, segments: 8 }, scene)
     impact.position.copyFrom(position)
-    impact.material = makeMaterial(scene, `impact-mat-${link.key}-${elapsed}`, COLORS[team], 0.9)
+    impact.material = impactMaterials[team]
     impact.isPickable = false
 
     const frameRate = 60
@@ -497,17 +517,53 @@ const game = (canvas: HTMLCanvasElement, options: GameOptions = {}) => {
     scene.beginAnimation(impact, 0, 11, false, 1, () => impact.dispose())
   }
 
+  function updateNeutralTint(node: Node) {
+    if (node.team !== 'neutral') return
+    const progress = Math.min(1, Math.abs(node.neutralInfluence) / node.neutralResistance)
+    const leadingTeam = node.neutralInfluence >= 0 ? 'player' : 'enemy'
+    const color = BABYLON.Color3.Lerp(COLORS.neutral, COLORS[leadingTeam], progress)
+    const shellMaterial = node.shell.material as BABYLON.StandardMaterial
+    shellMaterial.diffuseColor = color.scale(0.32)
+    shellMaterial.emissiveColor = color
+    shellMaterial.specularColor = color
+    node.motes.forEach(mote => {
+      const material = mote.material as BABYLON.StandardMaterial
+      material.diffuseColor = color.scale(0.32)
+      material.emissiveColor = color
+      material.specularColor = color
+    })
+    node.visual?.getChildMeshes(false).forEach(mesh => {
+      const material = mesh.material
+      if (material instanceof BABYLON.PBRMaterial) {
+        material.albedoColor = color.scale(0.42)
+        material.emissiveColor = color.scale(0.75)
+      } else if (material instanceof BABYLON.StandardMaterial) {
+        material.diffuseColor = color.scale(0.42)
+        material.emissiveColor = color.scale(0.75)
+      }
+    })
+  }
+
   const deliver = (link: Link, team: Exclude<Team, 'neutral'>, impactPosition: BABYLON.Vector3) => {
     createImpact(link, team, impactPosition)
-    if (link.to.team === team) {
-      if (link.to.energy >= link.to.maxEnergy - 0.001) {
-        forwardOverflow(link.to)
+    const target = link.to
+    if (target.team === team) {
+      if (target.energy >= target.maxEnergy - 0.001) {
+        forwardOverflow(target)
       } else {
-        link.to.energy = Math.min(link.to.maxEnergy, link.to.energy + 1)
+        target.energy = Math.min(target.maxEnergy, target.energy + 1)
       }
+    } else if (target.team === 'neutral') {
+      // Neutral capture is a tug-of-war: cyan adds influence and pink removes it.
+      // Opposing hits cancel prior progress instead of independently damaging the node.
+      target.neutralInfluence += team === 'player' ? 1 : -1
+      target.energy = Math.max(0, target.neutralResistance - Math.abs(target.neutralInfluence))
+      updateNeutralTint(target)
+      if (target.neutralInfluence >= target.neutralResistance) capture(target, 'player')
+      else if (target.neutralInfluence <= -target.neutralResistance) capture(target, 'enemy')
     } else {
-      link.to.energy -= 1
-      if (link.to.energy <= 0) capture(link.to, team)
+      target.energy -= 1
+      if (target.energy <= 0) capture(target, team)
     }
   }
 
@@ -543,6 +599,7 @@ const game = (canvas: HTMLCanvasElement, options: GameOptions = {}) => {
       team: node.team,
       energy: node.energy,
       maxEnergy: node.maxEnergy,
+      neutralInfluence: node.neutralInfluence,
       position: { x: node.position.x, y: node.position.y, z: node.position.z },
     })),
     links: Array.from(links.values()).map(link => ({ from: link.from.id, to: link.to.id, active: link.firing })),
@@ -601,7 +658,7 @@ const game = (canvas: HTMLCanvasElement, options: GameOptions = {}) => {
   snapshot()
   engine.runRenderLoop(() => {
     const realDt = Math.min(engine.getDeltaTime() / 1000, 0.05)
-    const timeScale = Math.max(1, Math.min(10, options.getTimeScale?.() || 1))
+    const timeScale = Math.max(1, Math.min(30, options.getTimeScale?.() || 1))
     const dt = realDt * timeScale
     elapsed += dt
     aiTimer -= dt

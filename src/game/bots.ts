@@ -5,6 +5,7 @@ export type BotNodeState = {
   team: BotSide | 'neutral'
   energy: number
   maxEnergy: number
+  neutralInfluence: number
   position: { x: number; y: number; z: number }
 }
 
@@ -139,6 +140,7 @@ export const EXAMPLE_BOT_SOURCE = `/**
  * @property {Team} team Current owner.
  * @property {number} energy Current strength.
  * @property {number} maxEnergy Maximum strength.
+ * @property {number} neutralInfluence Signed capture progress: positive is player, negative is enemy.
  * @property {{x: number, y: number, z: number}} position World position.
  *
  * @typedef {Object} BotLink

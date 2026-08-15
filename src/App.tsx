@@ -7,6 +7,12 @@ import { BotDebugEntry, ControllerConfig, EXAMPLE_BOT_SOURCE, SavedBot } from '.
 
 const initialState: GameSnapshot = { playerNodes: 1, enemyNodes: 1, neutralNodes: 5, status: 'playing', selected: false }
 const BOT_STORAGE_KEY = 'neural-front-bots'
+const PLAYER_CONTROLLER_KEY = 'neural-front-player-controller'
+const ENEMY_CONTROLLER_KEY = 'neural-front-enemy-controller'
+
+const loadControllerChoice = (key: string, fallback: string) => {
+  try { return localStorage.getItem(key) || fallback } catch { return fallback }
+}
 
 const loadBots = (): SavedBot[] => {
   try { return JSON.parse(localStorage.getItem(BOT_STORAGE_KEY) || '[]') } catch { return [] }
@@ -17,8 +23,8 @@ function App() {
   const [gameKey, setGameKey] = useState(0)
   const [bots, setBots] = useState<SavedBot[]>(loadBots)
   const [builtInBots, setBuiltInBots] = useState<SavedBot[]>([])
-  const [playerChoice, setPlayerChoice] = useState('human')
-  const [enemyChoice, setEnemyChoice] = useState('default')
+  const [playerChoice, setPlayerChoice] = useState(() => loadControllerChoice(PLAYER_CONTROLLER_KEY, 'human'))
+  const [enemyChoice, setEnemyChoice] = useState(() => loadControllerChoice(ENEMY_CONTROLLER_KEY, 'default'))
   const [labOpen, setLabOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [botName, setBotName] = useState('My Strategy')
@@ -32,6 +38,8 @@ function App() {
   const [timeScale, setTimeScale] = useState(1)
 
   useEffect(() => { localStorage.setItem(BOT_STORAGE_KEY, JSON.stringify(bots)) }, [bots])
+  useEffect(() => { localStorage.setItem(PLAYER_CONTROLLER_KEY, playerChoice) }, [playerChoice])
+  useEffect(() => { localStorage.setItem(ENEMY_CONTROLLER_KEY, enemyChoice) }, [enemyChoice])
   useEffect(() => {
     let cancelled = false
     fetch(`${process.env.PUBLIC_URL}/bots/index.json`)
@@ -105,7 +113,7 @@ function App() {
   }, [releaseTimeScale])
 
   const changeTimeScale = (value: number) => {
-    const next = Math.max(1, Math.min(10, Math.round(value)))
+    const next = Math.max(1, Math.min(30, Math.round(value)))
     timeScaleRef.current = next
     setTimeScale(next)
   }
@@ -189,7 +197,7 @@ function App() {
         <input
           type="range"
           min="1"
-          max="10"
+          max="30"
           step="1"
           value={timeScale}
           aria-label="Simulation speed"
@@ -199,7 +207,7 @@ function App() {
           onPointerCancel={releaseTimeScale}
           onKeyUp={releaseTimeScale}
         />
-        <div className="time-ticks">{Array.from({ length: 10 }, (_, index) => <i key={index} />)}</div>
+        <div className="time-ticks">{Array.from({ length: 30 }, (_, index) => <i key={index} />)}</div>
       </section>
 
       <footer className="hud tutorial">
